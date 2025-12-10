@@ -10,6 +10,9 @@ dependencies:
   flutter:
     sdk: flutter
   syncfusion_flutter_charts: ^24.2.7+1
+  path_provider: ^2.0.11
+  permission_handler: ^8.3.0
+  butter: ^1.0.0
 
 dev_dependencies:
   flutter_test:
@@ -18,3 +21,4 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
