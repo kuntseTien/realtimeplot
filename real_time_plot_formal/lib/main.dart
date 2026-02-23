@@ -1,15 +1,10 @@
 import 'package:flutter/material.dart';
 import 'realtime_plot.dart';
-import 'package:permission_handler/permission_handler.dart';
+// import 'offline_test_page.dart'; // 要測 offline 再切換
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized(); // 確保Flutter绑定初始化
-  await requestPermissions(); // 請求權限
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const MainApp());
-}
-
-Future<void> requestPermissions() async {
-  await Permission.storage.request();
 }
 
 class MainApp extends StatelessWidget {
@@ -18,7 +13,9 @@ class MainApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return const MaterialApp(
-      home: RealTimePlotPage(initialDataLength: 3000),
+      debugShowCheckedModeBanner: false,
+      home: RealTimePlotPage(), // realtime 測試用
+      // home: OfflineTestPage(), // offline 測試用
     );
   }
 }
