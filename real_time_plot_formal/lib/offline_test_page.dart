@@ -1,6 +1,7 @@
+// lib/offline_test_page.dart
 import 'dart:async';
 import 'dart:io';
-import 'dart:math';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -8,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_charts/charts.dart';
 
 import 'onnx/onnx_stand_channel.dart';
+import 'overlap_add_inferencer.dart';
 
 class DataPoint {
   final double t;
@@ -15,42 +17,72 @@ class DataPoint {
   DataPoint(this.t, this.y);
 }
 
-// ======================================================
-// ✅ Realtime causal Butterworth (SOS) 10 Hz LP
-// (跟你 realtime 那份一樣：兩段 SOS + gains + states)
-// ======================================================
-class ButterworthFilter10Hz {
-  final List<List<double>> sos = const [
-    [1, 2, 1, -1.975269634851873, 0.97624479235944],
-    [1, 2, 1, -1.9426382305401135, 0.9435972784703671],
-  ];
+/// ======================================================
+/// MATLAB-aligned Butterworth(2) 10Hz + filtfilt
+/// MATLAB:
+///   [b10,a10] = butter(2,10/(1000/2));
+///   b10 = [0.0009 0.0019 0.0009]
+///   a10 = [1.0000 -1.9112 0.9150]
+/// ======================================================
+class Butterworth2Filtfilt10Hz {
+  static const List<double> b = [0.0009, 0.0019, 0.0009];
+  static const List<double> a = [1.0, -1.9112, 0.9150];
 
-  final List<double> gains = const [
-    0.00024378937689168925,
-    0.00023976198256338974,
-  ];
+  static Float64List _lfilter(Float64List x) {
+    final y = Float64List(x.length);
+    double z1 = 0.0, z2 = 0.0;
 
-  final List<List<double>> states = List.generate(2, (_) => [0.0, 0.0]);
+    final b0 = b[0], b1 = b[1], b2 = b[2];
+    final a1 = a[1], a2 = a[2];
 
-  double apply(double input) {
-    double x = input;
-    for (int i = 0; i < sos.length; i++) {
-      final b = sos[i];
-      final s = states[i];
-      final v = x - b[3] * s[0] - b[4] * s[1];
-      final y = gains[i] * (b[0] * v + b[1] * s[0] + b[2] * s[1]);
-      s[1] = s[0];
-      s[0] = v;
-      x = y;
+    for (int n = 0; n < x.length; n++) {
+      final xn = x[n];
+      final yn = b0 * xn + z1;
+      z1 = b1 * xn - a1 * yn + z2;
+      z2 = b2 * xn - a2 * yn;
+      y[n] = yn;
     }
-    return x;
+    return y;
   }
 
-  void reset() {
-    for (final s in states) {
-      s[0] = 0.0;
-      s[1] = 0.0;
+  static Float64List _reverse(Float64List x) {
+    final y = Float64List(x.length);
+    for (int i = 0; i < x.length; i++) {
+      y[i] = x[x.length - 1 - i];
     }
+    return y;
+  }
+
+  static Float64List _mirrorPad(Float64List x, int pad) {
+    final n = x.length;
+    final p = math.min(pad, n - 1);
+    final out = Float64List(n + 2 * p);
+
+    // left
+    for (int i = 0; i < p; i++) out[i] = x[p - i];
+    // center
+    for (int i = 0; i < n; i++) out[p + i] = x[i];
+    // right
+    for (int i = 0; i < p; i++) out[p + n + i] = x[n - 2 - i];
+
+    return out;
+  }
+
+  static Float64List _unpad(Float64List x, int pad, int originalLen) {
+    final p = math.min(pad, originalLen - 1);
+    final y = Float64List(originalLen);
+    for (int i = 0; i < originalLen; i++) y[i] = x[p + i];
+    return y;
+  }
+
+  static Float64List filtfilt(Float64List x, {int pad = 300}) {
+    if (x.length < 3) return Float64List.fromList(x);
+    final padded = _mirrorPad(x, pad);
+    final fwd = _lfilter(padded);
+    final rev1 = _reverse(fwd);
+    final bwd = _lfilter(rev1);
+    final rev2 = _reverse(bwd);
+    return _unpad(rev2, pad, x.length);
   }
 }
 
@@ -63,18 +95,27 @@ class OfflineTestPage extends StatefulWidget {
 
 class _OfflineTestPageState extends State<OfflineTestPage> {
   // ---- Config ----
-  static const String kAssetCsv = 'assets/testdata/chirustand03.csv';
   static const int fs = 1000;
   static const int startIdx = 4000;
   static const int endIdx = 74000;
 
-  // Flow voltage -> SLM formula (同你 MATLAB)
   static const double VDD = 5.0;
   static const double V_ZERO = 0.74;
 
-  // sliding window
   static const int winSize = 2000;
   static const int stride = 200;
+  static const double dropRatio = 0.05;
+
+  // ---- Selectors ----
+  final List<String> _models = const ['STAND', 'DB', 'SLEEP'];
+
+  final Map<String, String> _assetCsvByModel = const {
+    'STAND': 'assets/testdata/chirustand03.csv',
+    'DB': 'assets/testdata/leeDB02.csv',
+    'SLEEP': 'assets/testdata/tiensleep01.csv',
+  };
+
+  String _currentModel = 'STAND';
 
   // ---- State ----
   bool _running = false;
@@ -91,15 +132,40 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
   // ---- Results to save ----
   Float64List? _t;
   Float64List? _vRaw;
-  Float64List? _v10;
-  Float64List? _trueSlm;
-  Float64List? _predSlm;
+  Float64List? _v10Full; // v10 filtfilt + mean0
+  Float64List? _trueSlm; // true flow filtfilt + mean0
+  Float64List? _predSlm; // pred SLM, then mean0 (MATLAB-aligned)
+
+  late OverlapAddInferencer _inferencer;
 
   @override
   void initState() {
     super.initState();
-    // 只初始化一次（STAND）
-    OnnxStandChannel.init("STAND");
+    _initModel(_currentModel);
+  }
+
+  Future<void> _initModel(String modelName) async {
+    await OnnxStandChannel.init(modelName);
+
+    _inferencer = OverlapAddInferencer(
+      winSize: winSize,
+      stride: stride,
+      dropRatio: dropRatio,
+      inferFn: (Float32List w) => OnnxStandChannel.infer(w),
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _currentModel = modelName;
+    });
+  }
+
+  String get _currentAssetCsv => _assetCsvByModel[_currentModel] ?? '';
+
+  String _basenameNoExt(String assetPath) {
+    final name = assetPath.split('/').last;
+    final dot = name.lastIndexOf('.');
+    return (dot > 0) ? name.substring(0, dot) : name;
   }
 
   void _appendLog(String s) {
@@ -109,11 +175,9 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
     setState(() => _log += '$s\n');
   }
 
-  // ===========================
-  // Main: Run offline pipeline
-  // ===========================
   Future<void> _runOffline() async {
     if (_running) return;
+
     setState(() {
       _running = true;
       _saving = false;
@@ -125,32 +189,33 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
       _truePlot.clear();
       _t = null;
       _vRaw = null;
-      _v10 = null;
+      _v10Full = null;
       _trueSlm = null;
       _predSlm = null;
     });
 
     try {
-      _appendLog('=== Offline CSV Test ===');
-      _appendLog('Loading $kAssetCsv ...');
+      _appendLog(
+          '=== Offline (Scheme-A) | model=$_currentModel | asset=$_currentAssetCsv ===');
+      _appendLog('win=$winSize, stride=$stride, dropRatio=$dropRatio');
+      _appendLog(
+          'MATLAB-aligned: filtfilt(10Hz) + mean0 in Dart; Kotlin does /sig + bestLag + denorm');
 
-      final csvText = await rootBundle.loadString(kAssetCsv);
+      final csvText = await rootBundle.loadString(_currentAssetCsv);
       final rows = _parseCsv(csvText);
       if (rows.isEmpty) {
-        _appendLog('❌ CSV empty.');
+        _appendLog('ERROR: CSV empty');
         return;
       }
 
       final nAll = rows.length;
-      _appendLog('Parsed samples = $nAll');
-
       final s0 = startIdx.clamp(0, nAll - 1);
       final s1 = endIdx.clamp(0, nAll - 1);
       final seg = rows.sublist(s0, s1 + 1);
       final n = seg.length;
-      _appendLog('Using segment: [$s0 .. $s1] => N=$n');
 
-      // allocate
+      _appendLog('Parsed=$nAll, segment=[$s0..$s1], N=$n');
+
       final t = Float64List(n);
       final vRaw = Float64List(n);
       final flowV = Float64List(n);
@@ -161,145 +226,70 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
         flowV[i] = seg[i][2];
       }
 
-      // ---- v10 (causal butterworth 10Hz) then mean removal ----
-      final v10 = _causalButterworth10Hz(vRaw);
-      _removeMeanInPlace(v10);
-
-      // ---- true flow (col3 formula) then causal butterworth 10Hz then mean removal ----
+      // ---- True flow: voltage -> flow -> filtfilt(10Hz) -> mean0 (MATLAB)
       final flowTrue = Float64List(n);
       for (int i = 0; i < n; i++) {
         flowTrue[i] = 212.5 * (((flowV[i] - V_ZERO) / VDD) - 0.1) - 10.0;
       }
-      final true10 = _causalButterworth10Hz(flowTrue);
-      _removeMeanInPlace(true10);
+      final flowLP = Butterworth2Filtfilt10Hz.filtfilt(flowTrue, pad: 300);
+      _removeMeanInPlace(flowLP);
 
-      // log v10 stats
-      double inMin = 1e18, inMax = -1e18, inMean = 0;
-      for (int i = 0; i < n; i++) {
-        final x = v10[i];
-        inMin = min(inMin, x);
-        inMax = max(inMax, x);
-        inMean += x;
-      }
-      inMean /= n;
-      _appendLog(
-          'v10 input stats: min=${inMin.toStringAsFixed(6)} max=${inMax.toStringAsFixed(6)} mean=${inMean.toStringAsFixed(6)}');
+      // ---- Piezo v10: filtfilt(10Hz) -> mean0 (MATLAB)
+      final v10LP = Butterworth2Filtfilt10Hz.filtfilt(vRaw, pad: 300);
+      _removeMeanInPlace(v10LP);
 
-      // ---- overlap-add inference ----
-      final predSlm = Float64List(n);
-      final wSum = Float64List(n);
+      // ---- Overlap-add prediction (Kotlin does v/sig only; bestLag fixed inside Kotlin)
+      final predSlm = await _inferencer.runOffline(v10LP);
 
-      for (int s = 0; s <= n - winSize; s += stride) {
-        final win = Float32List(winSize);
-        for (int i = 0; i < winSize; i++) {
-          win[i] = v10[s + i]; // double -> float32 (Dart 允許)
-        }
-
-        final y =
-            await OnnxStandChannel.infer(win); // Kotlin 回來 SLM (Float32List)
-
-        for (int i = 0; i < winSize && i < y.length; i++) {
-          final idx = s + i;
-          predSlm[idx] += y[i].toDouble();
-          wSum[idx] += 1.0;
-        }
-
-        if (s % (stride * 50) == 0) {
-          _appendLog('Infer progress: s=$s / ${n - winSize}');
-          await Future.delayed(Duration.zero);
-        }
+      // MATLAB edge behavior: pred_sum/w_sum leaves zeros where no window contributed
+      // Our inferencer returns NaN where wSum==0; convert NaN -> 0 before mean removal
+      for (int i = 0; i < predSlm.length; i++) {
+        if (predSlm[i].isNaN) predSlm[i] = 0.0;
       }
 
-      for (int i = 0; i < n; i++) {
-        predSlm[i] = (wSum[i] > 0) ? (predSlm[i] / wSum[i]) : 0.0;
-      }
+      // MATLAB: flow_pred = flow_pred - mean(flow_pred)
+      _removeMeanInPlace(predSlm);
 
-      // ---- Pred stats ----
-      int zeroCount = 0;
-      int nanCount = 0;
-      double predMin = 1e18, predMax = -1e18, predMean = 0;
-      int valid = 0;
-
-      for (int i = 0; i < n; i++) {
-        final x = predSlm[i];
-        if (x.isNaN) {
-          nanCount++;
-          continue;
-        }
-        if (x == 0.0) {
-          zeroCount++;
-          continue;
-        }
-        predMin = min(predMin, x);
-        predMax = max(predMax, x);
-        predMean += x;
-        valid++;
-      }
-      predMean = (valid > 0) ? (predMean / valid) : 0.0;
-
-      _appendLog(
-          'Pred SLM valid=$valid, zeroCount=$zeroCount, nanCount=$nanCount');
-      _appendLog(
-          'Pred SLM min/max (valid only) = [${predMin.toStringAsFixed(6)}, ${predMax.toStringAsFixed(6)}], mean=${predMean.toStringAsFixed(6)}');
-
-      // ---- Build plots (downsample) ----
+      // ---- Downsample for plots
       const int ds = 10;
       for (int i = 0; i < n; i += ds) {
-        final tt = t[i];
-        _vRawPlot.add(DataPoint(tt, vRaw[i]));
-        _v10Plot.add(DataPoint(tt, v10[i]));
-        _predPlot.add(DataPoint(tt, predSlm[i]));
-        _truePlot.add(DataPoint(tt, true10[i]));
+        _vRawPlot.add(DataPoint(t[i], vRaw[i]));
+        _v10Plot.add(DataPoint(t[i], v10LP[i]));
+        _predPlot.add(DataPoint(t[i], predSlm[i]));
+        _truePlot.add(DataPoint(t[i], flowLP[i]));
       }
 
-      _appendLog('Preview (every 100 samples, first 5s):');
-      final maxShow = min(n, 5000);
-      for (int i = 0; i < maxShow; i += 100) {
-        _appendLog(
-            't=${t[i].toStringAsFixed(3)}  predSLM=${predSlm[i].toStringAsFixed(3)}  trueSLM=${true10[i].toStringAsFixed(3)}');
-      }
-
-      // store for save
       _t = t;
       _vRaw = vRaw;
-      _v10 = v10;
-      _trueSlm = true10;
+      _v10Full = v10LP;
+      _trueSlm = flowLP;
       _predSlm = predSlm;
 
-      setState(() {
-        _hasResult = true;
-      });
+      setState(() => _hasResult = true);
       _appendLog('=== Done (ready to SAVE) ===');
     } catch (e, st) {
-      _appendLog('❌ ERROR: $e');
+      _appendLog('ERROR: $e');
       _appendLog('$st');
     } finally {
       if (mounted) setState(() => _running = false);
     }
   }
 
-  // ===========================
-  // SAVE CSV (chunk writing + CRLF + BOM)
-  // ===========================
   Future<void> _saveCsv() async {
-    _appendLog(
-        '[SAVE] pressed. running=$_running saving=$_saving hasResult=$_hasResult');
-    if (_running || _saving) return;
-    if (!_hasResult) {
-      _appendLog('❌ No result to save yet.');
-      return;
-    }
+    if (_running || _saving || !_hasResult) return;
+
     final t = _t;
     final vRaw = _vRaw;
-    final v10 = _v10;
+    final v10Full = _v10Full;
     final trueSlm = _trueSlm;
     final predSlm = _predSlm;
+
     if (t == null ||
         vRaw == null ||
-        v10 == null ||
+        v10Full == null ||
         trueSlm == null ||
         predSlm == null) {
-      _appendLog('❌ Internal: result buffers missing.');
+      _appendLog('ERROR: buffers missing');
       return;
     }
 
@@ -307,18 +297,23 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
 
     try {
       final ts = DateTime.now().toIso8601String().replaceAll(':', '-');
-      final path =
-          '/data/user/0/com.example.real_time_plot_formal/app_flutter/offline_pred_true_$ts.csv';
-      _appendLog('[SAVE] writing to: $path');
+
+      // ✅ 這行一定要在同一個 scope 內宣告並使用
+      final fileTag = _basenameNoExt(_currentAssetCsv);
+
+      final path = '/data/user/0/com.example.real_time_plot_formal/app_flutter/'
+          'offline_schemeA_${_currentModel}_${fileTag}_$ts.csv';
 
       final file = File(path);
       final sink = file.openWrite(mode: FileMode.writeOnly);
 
-      // BOM for Excel
+      // UTF-8 BOM (Excel friendly)
       sink.add(const [0xEF, 0xBB, 0xBF]);
 
-      // Header (CRLF)
-      sink.write('t_s,vraw_v,v10_v,true_slm,pred_slm\r\n');
+      // 欄位名稱統一
+      sink.write('t_s,vraw_v,v10_filtfilt_mean0_v,true_slm,pred_slm\r\n');
+
+      String fmt(double x) => x.isNaN ? '' : x.toStringAsFixed(6);
 
       const int chunk = 5000;
       final sb = StringBuffer();
@@ -330,44 +325,36 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
           ..write(',')
           ..write(vRaw[i].toStringAsFixed(6))
           ..write(',')
-          ..write(v10[i].toStringAsFixed(6))
+          ..write(fmt(v10Full[i]))
           ..write(',')
-          ..write(trueSlm[i].toStringAsFixed(6))
+          ..write(fmt(trueSlm[i]))
           ..write(',')
-          ..write(predSlm[i].toStringAsFixed(6))
+          ..write(fmt(predSlm[i]))
           ..write('\r\n');
 
         if ((i + 1) % chunk == 0) {
           sink.write(sb.toString());
           sb.clear();
           await sink.flush();
-          await Future.delayed(Duration.zero); // 讓 UI 不會卡死
-          _appendLog('[SAVE] progress ${(i + 1)}/$n');
+          await Future.delayed(Duration.zero);
+          _appendLog('[SAVE] ${(i + 1)}/$n');
         }
       }
 
-      if (sb.isNotEmpty) {
-        sink.write(sb.toString());
-        sb.clear();
-      }
+      if (sb.isNotEmpty) sink.write(sb.toString());
 
       await sink.flush();
       await sink.close();
 
-      _appendLog('✅ Exported CSV: $path');
-      _appendLog(
-          '👉 adb exec-out run-as com.example.real_time_plot_formal cat app_flutter/${path.split('/').last} > "C:\\Users\\kuntse\\Desktop\\Download_backu\\${path.split('/').last}"');
+      _appendLog('Saved in app_flutter: ${path.split('/').last}');
     } catch (e, st) {
-      _appendLog('❌ SAVE ERROR: $e');
+      _appendLog('SAVE ERROR: $e');
       _appendLog('$st');
     } finally {
       if (mounted) setState(() => _saving = false);
     }
   }
 
-  // ===========================
-  // CSV parse
-  // ===========================
   List<List<double>> _parseCsv(String text) {
     final lines = text.split(RegExp(r'\r?\n'));
     final out = <List<double>>[];
@@ -390,38 +377,23 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
     return out;
   }
 
-  // ===========================
-  // Causal Butterworth 10Hz (realtime style)
-  // ===========================
-  Float64List _causalButterworth10Hz(Float64List x) {
-    final y = Float64List(x.length);
-    final f = ButterworthFilter10Hz();
-    for (int i = 0; i < x.length; i++) {
-      y[i] = f.apply(x[i]);
-    }
-    return y;
-  }
-
   void _removeMeanInPlace(Float64List x) {
     double sum = 0;
     for (int i = 0; i < x.length; i++) sum += x[i];
-    final mean = sum / x.length;
+    final mean = sum / x.length.toDouble();
     for (int i = 0; i < x.length; i++) x[i] -= mean;
   }
 
-  // ===========================
-  // UI
-  // ===========================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Offline CSV → Voltage & Flow Plot'),
+        title: const Text('Offline Scheme-A (MATLAB-aligned)'),
         actions: [
           IconButton(
             onPressed: _running ? null : _runOffline,
             icon: const Icon(Icons.refresh),
-          )
+          ),
         ],
       ),
       body: Column(
@@ -431,6 +403,21 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Row(
               children: [
+                // Model selector
+                DropdownButton<String>(
+                  value: _currentModel,
+                  items: _models
+                      .map((m) => DropdownMenuItem(value: m, child: Text(m)))
+                      .toList(),
+                  onChanged: _running
+                      ? null
+                      : (v) async {
+                          if (v == null) return;
+                          await _initModel(v);
+                          _appendLog('[MODEL] switched to $v');
+                        },
+                ),
+                const SizedBox(width: 10),
                 ElevatedButton(
                   onPressed: _running ? null : _runOffline,
                   child: Text(_running ? 'Running...' : 'Run Offline Test'),
@@ -444,10 +431,10 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    kAssetCsv,
+                    _currentAssetCsv,
                     overflow: TextOverflow.ellipsis,
                   ),
-                )
+                ),
               ],
             ),
           ),
@@ -473,20 +460,19 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
     return SizedBox(
       height: 260,
       child: SfCartesianChart(
-        title: const ChartTitle(
-            text: 'Voltage (Raw & 10Hz Causal Butterworth Mean-Removed)'),
+        title: const ChartTitle(text: 'Voltage (Raw vs v10 filtfilt+mean0)'),
         legend: const Legend(isVisible: true),
         primaryXAxis: const NumericAxis(title: AxisTitle(text: 'Time (s)')),
         primaryYAxis: const NumericAxis(title: AxisTitle(text: 'Voltage (V)')),
         series: <LineSeries<DataPoint, double>>[
           LineSeries<DataPoint, double>(
-            name: 'Vraw (col2)',
+            name: 'Vraw',
             dataSource: _vRawPlot,
             xValueMapper: (p, _) => p.t,
             yValueMapper: (p, _) => p.y,
           ),
           LineSeries<DataPoint, double>(
-            name: 'V10 (Butterworth+mean0)',
+            name: 'V10 (filtfilt+mean0)',
             dataSource: _v10Plot,
             xValueMapper: (p, _) => p.t,
             yValueMapper: (p, _) => p.y,
@@ -500,19 +486,20 @@ class _OfflineTestPageState extends State<OfflineTestPage> {
     return SizedBox(
       height: 260,
       child: SfCartesianChart(
-        title: const ChartTitle(text: 'Flow (SLM) — Pred vs True'),
+        title: ChartTitle(
+            text: 'Flow (SLM) — Pred vs True | model=$_currentModel'),
         legend: const Legend(isVisible: true),
         primaryXAxis: const NumericAxis(title: AxisTitle(text: 'Time (s)')),
         primaryYAxis: const NumericAxis(title: AxisTitle(text: 'Flow (SLM)')),
         series: <LineSeries<DataPoint, double>>[
           LineSeries<DataPoint, double>(
-            name: 'Pred SLM (ONNX)',
+            name: 'Pred SLM (phone, mean0)',
             dataSource: _predPlot,
             xValueMapper: (p, _) => p.t,
             yValueMapper: (p, _) => p.y,
           ),
           LineSeries<DataPoint, double>(
-            name: 'True SLM (col3 → formula → Butterworth+mean0)',
+            name: 'True SLM (filtfilt+mean0)',
             dataSource: _truePlot,
             xValueMapper: (p, _) => p.t,
             yValueMapper: (p, _) => p.y,

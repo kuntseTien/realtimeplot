@@ -10,7 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   syncfusion_flutter_charts: ^24.2.7+1
-  path_provider: ^2.1.2
+  path_provider: ^2.1.3
   permission_handler: ^8.3.0
   butter: ^1.0.0
 
@@ -26,6 +26,8 @@ flutter:
     - assets/DB.onnx
     - assets/SLEEP.onnx
     - assets/testdata/chirustand03.csv
+    - assets/testdata/leeDB02.csv
+    - assets/testdata/tiensleep01.csv
 
 
 
